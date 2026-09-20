@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         沪上插班生视频优化
 // @namespace    https://wq.bunanguo.com/
-// @version      2.1.0
-// @description  在沪上插班生 (wq.bunanguo.com) 播放视频时，避免因切换标签页或最小化窗口导致视频自动暂停，并优化播放器控件显示（鼠标/触摸移动显示、静止约3秒自动隐藏，支持普通与全屏模式）
+// @version      2.2.0
+// @description  在沪上插班生 (wq.bunanguo.com) 播放视频时，避免因切换标签页或最小化窗口导致视频自动暂停，优化播放器控件显示（鼠标/触摸移动显示、静止约3秒自动隐藏，支持普通与全屏模式），并自动隐藏视频水印覆盖层
 // @author       zhujunxi
 // @license      GPL-3.0-or-later
 // @match        *://wq.bunanguo.com/*
@@ -369,7 +369,118 @@
     initPlayerControlsFix({ mode: "move", idle_ms: 3000 });
 
     /* =========================================================================
-     * 第三部分：页面提示与初始化通知
+     * 第三部分：视频水印净化与隐藏
+     * ========================================================================= */
+    function initWatermarkRemover(args) {
+      args = args || {};
+      const NS = "__tabbit_watermark_remover__";
+      const STYLE_ID = NS + "_style";
+      const SCOPE = args && args.scope ? String(args.scope) : "video-watermark";
+      const SELECTOR = "." + SCOPE + ", ." + SCOPE + "-text";
+
+      // Reuse / tear down a previous instance so effects never stack.
+      if (globalThis[NS] && typeof globalThis[NS].destroy === "function") {
+        try { globalThis[NS].destroy(); } catch (e) {}
+      }
+      if (globalThis["__hsWatermarkRemover"] && typeof globalThis["__hsWatermarkRemover"].destroy === "function") {
+        try { globalThis["__hsWatermarkRemover"].destroy(); } catch (e) {}
+      }
+
+      const getTargets = () => Array.from(document.querySelectorAll(SELECTOR));
+
+      const css = "." + SCOPE + ", ." + SCOPE + "-text { display: none !important; }";
+      let styleEl = document.getElementById(STYLE_ID);
+      if (!styleEl) {
+        styleEl = document.createElement("style");
+        styleEl.id = STYLE_ID;
+        styleEl.setAttribute("data-tabbit", NS);
+        styleEl.setAttribute("data-hs-opt", "watermark-remover");
+        styleEl.textContent = css;
+        const parent = document.head || document.documentElement;
+        if (parent) {
+          parent.appendChild(styleEl);
+        } else {
+          origDocAddEventListener.call(nativeDoc, "DOMContentLoaded", () => {
+            const p = document.head || document.documentElement;
+            if (p && !document.getElementById(STYLE_ID)) p.appendChild(styleEl);
+          }, { once: true });
+        }
+      }
+
+      // Independent postcondition check from rendered state.
+      function isHidden(el) {
+        const cs = getComputedStyle(el);
+        return cs.display === "none" || cs.visibility === "hidden";
+      }
+
+      const controller = {
+        id: NS,
+        selector: SELECTOR,
+        styleEl: styleEl,
+        get count() {
+          return getTargets().length;
+        },
+        hide() {
+          if (styleEl) {
+            styleEl.disabled = false;
+            if (!styleEl.parentNode) {
+              (document.head || document.documentElement).appendChild(styleEl);
+            }
+          }
+        },
+        show() {
+          if (styleEl && styleEl.parentNode) {
+            styleEl.parentNode.removeChild(styleEl);
+          }
+        },
+        destroy() {
+          if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl);
+          if (globalThis[NS] === controller) delete globalThis[NS];
+          if (globalThis["__hsWatermarkRemover"] === controller) delete globalThis["__hsWatermarkRemover"];
+        },
+        getState() {
+          const targets = getTargets();
+          const hiddenNow = targets.filter(isHidden).length;
+          return {
+            id: NS,
+            selector: SELECTOR,
+            matched_count: targets.length,
+            hidden_count: hiddenNow,
+            style_present: !!document.getElementById(STYLE_ID),
+            style_disabled: !!(styleEl && styleEl.disabled)
+          };
+        },
+        run: (newArgs) => initWatermarkRemover(newArgs)
+      };
+
+      globalThis[NS] = controller;
+      globalThis["__hsWatermarkRemover"] = controller;
+
+      const targets = getTargets();
+      const hiddenNow = targets.filter(isHidden).length;
+      const ok = targets.length > 0 && hiddenNow === targets.length;
+
+      return {
+        ok: ok,
+        summary: ok
+          ? ("已隐藏水印覆盖层 " + hiddenNow + "/" + targets.length + " 个元素（刷新页面即可恢复）")
+          : "已注入水印隐藏规则（若当前无水印，出现时将自动隐藏）",
+        matched_count: targets.length,
+        hidden_count: hiddenNow,
+        data: {
+          selector: SELECTOR,
+          scope_root: ".uni-video-slots",
+          sample_text: targets.map(function (t) { return (t.textContent || "").trim().slice(0, 24); })
+        },
+        warnings: targets.length === 0 ? ["当前页面未匹配到水印元素，已预置隐藏样式"] : []
+      };
+    }
+
+    // 默认启用视频水印净化与隐藏
+    initWatermarkRemover({ scope: "video-watermark" });
+
+    /* =========================================================================
+     * 第四部分：页面提示与初始化通知
      * ========================================================================= */
     function showNotification() {
       const tip = document.createElement("div");
@@ -404,7 +515,7 @@
       origDocAddEventListener.call(nativeDoc, "DOMContentLoaded", showNotification, { once: true });
     }
 
-    console.log("%c[沪上插班生视频优化] 核心注入成功（后台防暂停 + 控件显示优化已就绪）！", "color: #10b981; font-weight: bold; font-size: 14px;");
+    console.log("%c[沪上插班生视频优化] 核心注入成功（后台防暂停 + 控件显示优化 + 视频水印隐藏已就绪）！", "color: #10b981; font-weight: bold; font-size: 14px;");
   }
 
   // ---- 注入器：突破扩展沙盒限制，强制注入到页面的真实主环境中 ----

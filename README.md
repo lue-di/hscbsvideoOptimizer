@@ -6,9 +6,10 @@
 
 专为**沪上插班生**（`wq.bunanguo.com` / `bunanguo.com`）学习网课平台打造的油猴用户脚本。
 
-解决网页播放器的两大核心痛点：
+解决网页播放器的三大核心痛点：
 1. **后台切屏防暂停**：切换标签页、最小化窗口或锁屏失焦时，避免视频被网页强制暂停；
-2. **播放器控件体验优化**：解决官方播放器控制栏容易消失或阻碍画面的问题，实现「鼠标/触控移动即呼出，静止约 3 秒平滑隐藏，拖拽进度条不隐藏」，普通模式与全屏模式双向支持。
+2. **播放器控件体验优化**：解决官方播放器控制栏容易消失或阻碍画面的问题，实现「鼠标/触控移动即呼出，静止约 3 秒平滑隐藏，拖拽进度条不隐藏」，普通模式与全屏模式双向支持；
+3. **视频水印净化与隐藏**：自动隐藏视频画面中飘动或常驻的个人信息与防录屏水印覆盖层（`.video-watermark`），还给学习者干净清爽的画面体验。
 
 ---
 
@@ -29,7 +30,12 @@
   - 网页全屏 / 真实全屏模式（`#goFullControl_*`）
 - **层级加固**：重设控制栏 `z-index: 1001`，避免控制条被页面其他浮层遮挡。
 
-### 3. 轻量纯粹 & 穿透注入
+### 3. 视频水印净化与隐藏
+- **全局样式级阻断**：自动向页面根节点注入高优先级样式规则（`!important`），无感隐藏视频插槽中的水印文本与浮层（`.video-watermark`, `.video-watermark-text`）。
+- **零开销即时生效**：纯 CSS 规则驱动，无需轮询或 DOM 监听损耗性能，完美兼容 uni-app 播放器组件的动态渲染。
+- **独立控制接口**：全局挂载 `__hsWatermarkRemover`（同时兼容 `__tabbit_watermark_remover__`）控制器，支持在控制台随时切换显示/隐藏或自定义选择器范围。
+
+### 4. 轻量纯粹 & 穿透注入
 - **零外部依赖**：纯原生 JavaScript 实现，体积小巧，毫秒级注入。
 - **主环境（Main World）穿透**：通过动态 `<script>` 标签突破扩展沙盒与页面环境的隔离，保证 API 重写与事件拦截 100% 生效。
 - **无感通知徽标**：脚本成功挂载后在右上角显示优雅的临时提示，3.5 秒后自动淡出消失。
@@ -62,6 +68,8 @@
 
 ## 🛠️ 控制台调试与高级调优 API
 
+### 1. 播放器控件控制 (`__hsPlayerControlsFix`)
+
 脚本在全局挂载了控制器实例 `window.__hsPlayerControlsFix`（同时兼容 `window.__tabbit_fatPlayerControlsFix`），可在浏览器开发者工具（F12 控制台）随时动态调优：
 
 ```javascript
@@ -85,6 +93,27 @@ console.log(__hsPlayerControlsFix.getState());
 
 // 7. 销毁并还原页面初始默认行为
 __hsPlayerControlsFix.destroy();
+```
+
+### 2. 视频水印控制 (`__hsWatermarkRemover`)
+
+脚本在全局挂载了水印控制器实例 `window.__hsWatermarkRemover`（同时兼容 `window.__tabbit_watermark_remover__`）：
+
+```javascript
+// 1. 获取当前水印隐藏状态及页面匹配元素
+console.log(__hsWatermarkRemover.getState());
+
+// 2. 临时恢复显示水印
+__hsWatermarkRemover.show();
+
+// 3. 重新隐藏水印
+__hsWatermarkRemover.hide();
+
+// 4. 自定义水印 scope 重新初始化（默认 scope 为 "video-watermark"）
+__hsWatermarkRemover.run({ scope: "video-watermark" });
+
+// 5. 销毁并移除注入的水印样式
+__hsWatermarkRemover.destroy();
 ```
 
 ---
