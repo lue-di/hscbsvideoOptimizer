@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         沪上插班生视频优化
 // @namespace    https://wq.bunanguo.com/
-// @version      2.2.0
-// @description  在沪上插班生 (wq.bunanguo.com) 播放视频时，避免因切换标签页或最小化窗口导致视频自动暂停，优化播放器控件显示（鼠标/触摸移动显示、静止约3秒自动隐藏，支持普通与全屏模式），并自动隐藏视频水印覆盖层
+// @version      2.3.0
+// @description  在沪上插班生 (wq.bunanguo.com) 播放视频时，避免因切换标签页或最小化窗口导致视频自动暂停，优化播放器控件显示（鼠标/触摸移动显示、静止约3秒自动隐藏，支持普通与全屏模式），自动隐藏视频水印覆盖层，并解决切屏切页后音画不同步/画面卡死问题
 // @author       zhujunxi
 // @license      GPL-3.0-or-later
 // @match        *://wq.bunanguo.com/*
@@ -93,10 +93,12 @@
       return origDocAddEventListener.apply(this, arguments);
     };
 
-    // 在捕获阶段吸收 visibilitychange 事件
+    // 在捕获阶段吸收切到后台时的 visibilitychange 事件（切回前台时放行以通知渲染管线刷新）
     const blockVis = (e) => {
       try {
-        e.stopImmediatePropagation();
+        if (isRealHidden()) {
+          e.stopImmediatePropagation();
+        }
       } catch (_) {}
     };
     origDocAddEventListener.call(nativeDoc, "visibilitychange", blockVis, true);
@@ -150,6 +152,75 @@
         }
       }
     }, 800);
+
+    // ---- 6. 切回前台音画重同步与画面假死自动自愈看门狗 ----
+    // Chromium 在后台会停止视频轨道硬件解码；切回前台通过毫秒级微跳帧强制清空陈旧帧缓存并唤醒解码器
+    function wakeUpVideoDecoder(v) {
+      if (!v || v.paused || v.ended || v.readyState < 2) return;
+      try {
+        const cur = v.currentTime;
+        if (Number.isFinite(cur)) {
+          const delta = (v.duration && cur + 0.001 >= v.duration) ? -0.001 : 0.001;
+          v.currentTime = cur + delta;
+        }
+      } catch (_) {}
+    }
+
+    let lastHiddenState = isRealHidden();
+    function onForegroundResync() {
+      const v = pickVideo();
+      if (!v || v.paused || v.ended) return;
+      setTimeout(() => wakeUpVideoDecoder(v), 40);
+      setTimeout(() => wakeUpVideoDecoder(v), 250);
+    }
+
+    window.addEventListener("focus", onForegroundResync, true);
+    window.addEventListener("pageshow", onForegroundResync, true);
+    origDocAddEventListener.call(nativeDoc, "visibilitychange", () => {
+      const nowHidden = isRealHidden();
+      if (lastHiddenState && !nowHidden) {
+        onForegroundResync();
+      }
+      lastHiddenState = nowHidden;
+    }, true);
+
+    // 结合现代浏览器 requestVideoFrameCallback 监听渲染帧，画面停滞时自动自愈
+    if (typeof HTMLVideoElement !== "undefined" && "requestVideoFrameCallback" in HTMLVideoElement.prototype) {
+      let lastPaintTime = performance.now();
+      let lastMediaTime = 0;
+      let rvfcPending = false;
+
+      function trackVideoFrames(v) {
+        if (!v || rvfcPending) return;
+        rvfcPending = true;
+        try {
+          v.requestVideoFrameCallback((now, metadata) => {
+            rvfcPending = false;
+            lastPaintTime = now;
+            lastMediaTime = metadata.mediaTime;
+            if (!v.paused && !v.ended) {
+              trackVideoFrames(v);
+            }
+          });
+        } catch (_) {
+          rvfcPending = false;
+        }
+      }
+
+      setInterval(() => {
+        if (isRealHidden()) return;
+        const v = pickVideo();
+        if (!v || v.paused || v.ended || v.readyState < 2) return;
+        trackVideoFrames(v);
+        const now = performance.now();
+        // 前台播放时，若时间轴持续推进超过 1 秒，但画面超过 1.5 秒未画出新帧，执行微跳帧唤醒
+        if (now - lastPaintTime > 1500 && Math.abs(v.currentTime - lastMediaTime) > 0.8) {
+          wakeUpVideoDecoder(v);
+          lastPaintTime = now;
+          lastMediaTime = v.currentTime;
+        }
+      }, 1000);
+    }
 
     /* =========================================================================
      * 第二部分：播放器控件显示优化（移动显示 / 静止约3秒自动隐藏）

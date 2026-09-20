@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         沪上插班生视频播放器替换
 // @namespace    https://wq.bunanguo.com/
-// @version      1.1.0
-// @description  在沪上插班生 (wq.bunanguo.com) 播放视频时，使用开源播放器 Plyr 接管原生播放器，保留原视频源与 HLS 解码管线，自动隐藏视频水印与原生冗余控件，支持网页全屏、丰富快捷键与后台防暂停
+// @version      1.2.0
+// @description  在沪上插班生 (wq.bunanguo.com) 播放视频时，使用开源播放器 Plyr 接管原生播放器，保留原视频源与 HLS 解码管线，自动隐藏视频水印与原生冗余控件，支持网页全屏、丰富快捷键、后台防暂停与切屏音画防假死同步
 // @author       zhujunxi
 // @license      GPL-3.0-or-later
 // @match        *://wq.bunanguo.com/*
@@ -88,7 +88,9 @@
 
     const blockVis = (e) => {
       try {
-        e.stopImmediatePropagation();
+        if (isRealHidden()) {
+          e.stopImmediatePropagation();
+        }
       } catch (_) {}
     };
     origDocAddEventListener.call(nativeDoc, "visibilitychange", blockVis, true);
@@ -137,6 +139,72 @@
         }
       }
     }, 800);
+
+    // ---- 6. 切回前台音画重同步与画面假死自动自愈看门狗 ----
+    function wakeUpVideoDecoder(v) {
+      if (!v || v.paused || v.ended || v.readyState < 2) return;
+      try {
+        const cur = v.currentTime;
+        if (Number.isFinite(cur)) {
+          const delta = (v.duration && cur + 0.001 >= v.duration) ? -0.001 : 0.001;
+          v.currentTime = cur + delta;
+        }
+      } catch (_) {}
+    }
+
+    let lastHiddenState = isRealHidden();
+    function onForegroundResync() {
+      const v = pickVideo();
+      if (!v || v.paused || v.ended) return;
+      setTimeout(() => wakeUpVideoDecoder(v), 40);
+      setTimeout(() => wakeUpVideoDecoder(v), 250);
+    }
+
+    window.addEventListener("focus", onForegroundResync, true);
+    window.addEventListener("pageshow", onForegroundResync, true);
+    origDocAddEventListener.call(nativeDoc, "visibilitychange", () => {
+      const nowHidden = isRealHidden();
+      if (lastHiddenState && !nowHidden) {
+        onForegroundResync();
+      }
+      lastHiddenState = nowHidden;
+    }, true);
+
+    if (typeof HTMLVideoElement !== "undefined" && "requestVideoFrameCallback" in HTMLVideoElement.prototype) {
+      let lastPaintTime = performance.now();
+      let lastMediaTime = 0;
+      let rvfcPending = false;
+
+      function trackVideoFrames(v) {
+        if (!v || rvfcPending) return;
+        rvfcPending = true;
+        try {
+          v.requestVideoFrameCallback((now, metadata) => {
+            rvfcPending = false;
+            lastPaintTime = now;
+            lastMediaTime = metadata.mediaTime;
+            if (!v.paused && !v.ended) {
+              trackVideoFrames(v);
+            }
+          });
+        } catch (_) {
+          rvfcPending = false;
+        }
+      }
+
+      setInterval(() => {
+        if (isRealHidden()) return;
+        const v = pickVideo();
+        if (!v || v.paused || v.ended || v.readyState < 2) return;
+        trackVideoFrames(v);
+        const now = performance.now();
+        if (now - lastPaintTime > 1500 && Math.abs(v.currentTime - lastMediaTime) > 0.8) {
+          wakeUpVideoDecoder(v);
+          lastPaintTime = now;
+          lastMediaTime = v.currentTime;
+        }
+      }, 1000);
+    }
 
     /* =========================================================================
      * 第二部分：视频水印净化与隐藏
