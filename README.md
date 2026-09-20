@@ -54,7 +54,9 @@
   - `↑`（上方向键）：音量增加 5%
   - `↓`（下方向键）：音量减少 5%
   - `M` 键：静音 / 取消静音
-  - `F` 键：进入 / 退出全屏
+  - `F` 键：进入 / 退出全屏（显示器系统全屏）
+  - `W` 键：进入 / 退出**网页全屏**（铺满浏览器视口，不遮挡浏览器标签栏）
+  - `Esc` 键：退出网页全屏
 
 ---
 
@@ -115,14 +117,18 @@ __hsPlayerControlsFix.destroy();
 安装「方案 B」后，可在控制台随时查看播放器实例与状态：
 
 ```javascript
-// 1. 获取当前播放状态（暂停、当前时间、总时长、音量、倍速）
+// 1. 获取当前播放状态（暂停、当前时间、总时长、音量、倍速、网页全屏状态）
 console.log(__tbVideoPlayer.state());
 
 // 2. 访问底层 Plyr 播放器实例与原生 video
 console.log(__tbVideoPlayer.player);
 console.log(__tbVideoPlayer.video);
 
-// 3. 销毁 Plyr 并还原页面原始播放器状态
+// 3. 切换网页全屏 / 查询网页全屏状态
+__tbVideoPlayer.toggleWebFs();
+console.log(__tbVideoPlayer.isWebFs());
+
+// 4. 销毁 Plyr 并还原页面原始播放器状态
 __tbVideoPlayer.destroy();
 ```
 

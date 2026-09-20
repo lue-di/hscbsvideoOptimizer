@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         沪上插班生视频播放器替换
 // @namespace    https://wq.bunanguo.com/
-// @version      1.0.0
-// @description  在沪上插班生 (wq.bunanguo.com) 播放视频时，使用开源播放器 Plyr 接管原生播放器，保留原视频源与 HLS 解码管线，自动隐藏视频水印与原生冗余控件，支持丰富快捷键与后台防暂停
+// @version      1.1.0
+// @description  在沪上插班生 (wq.bunanguo.com) 播放视频时，使用开源播放器 Plyr 接管原生播放器，保留原视频源与 HLS 解码管线，自动隐藏视频水印与原生冗余控件，支持网页全屏、丰富快捷键与后台防暂停
 // @author       zhujunxi
 // @license      GPL-3.0-or-later
 // @match        *://wq.bunanguo.com/*
@@ -252,6 +252,7 @@
      * ========================================================================= */
     const NS = '__tbVideoPlayer';
     const CSS_ID = 'tb-video-player-style';
+    const WEBFS_CSS_ID = 'tb-webfs-style';
     const PLYR_CSS_ID = 'tb-plyr-css';
     const PLYR_JS_ID = 'tb-plyr-js';
     const PLYR_CSS = 'https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.css';
@@ -320,9 +321,46 @@
       `;
     }
 
+    function ensureWebFsStyle() {
+      let webfsStyle = document.getElementById(WEBFS_CSS_ID);
+      if (!webfsStyle) {
+        webfsStyle = document.createElement('style');
+        webfsStyle.id = WEBFS_CSS_ID;
+        (document.head || document.documentElement).appendChild(webfsStyle);
+      }
+      webfsStyle.textContent = `
+        #VideoView.tb-webfs {
+          position: fixed !important;
+          top: 0 !important;
+          left: 0 !important;
+          width: 100vw !important;
+          height: 100vh !important;
+          max-width: none !important;
+          max-height: none !important;
+          margin: 0 !important;
+          z-index: 2147483000 !important;
+          background: #000;
+        }
+        #VideoView.tb-webfs video,
+        #VideoView.tb-webfs .plyr,
+        #VideoView.tb-webfs .plyr__video-wrapper {
+          width: 100% !important;
+          height: 100% !important;
+        }
+        body:has(#VideoView.tb-webfs) {
+          overflow: hidden !important;
+        }
+        .plyr__control.tb-webfs-btn[data-state="on"] {
+          background: var(--plyr-color-main, #00b3ff) !important;
+          color: #fff !important;
+        }
+      `;
+    }
+
     // 立即发起样式和库的预加载
     ensureCss(PLYR_CSS, PLYR_CSS_ID);
     ensurePlayerStyle();
+    ensureWebFsStyle();
     loadJs(PLYR_JS, PLYR_JS_ID).catch(() => {});
 
     let currentInstance = null;
@@ -380,6 +418,7 @@
         }
 
         ensurePlayerStyle();
+        ensureWebFsStyle();
 
         const player = new globalThis.Plyr(video, {
           controls: [
@@ -413,6 +452,40 @@
           }
         });
         player.speed = 1;
+
+        // ---------- 网页全屏（铺满浏览器视口，非系统全屏 API） ----------
+        const isWebFs = () => root.classList.contains('tb-webfs');
+        let webfsBtn = null;
+        const toggleWebFs = (force) => {
+          const nextState = typeof force === 'boolean' ? force : !isWebFs();
+          root.classList.toggle('tb-webfs', nextState);
+          if (webfsBtn) webfsBtn.setAttribute('data-state', nextState ? 'on' : 'off');
+          return nextState;
+        };
+
+        // 在 Plyr 控制栏全屏按钮旁插入网页全屏按钮
+        const setupWebFsButton = () => {
+          if (root.querySelector('.tb-webfs-btn')) return;
+          try {
+            const fsPlyrBtn = root.querySelector('.plyr__controls .plyr__control[data-plyr="fullscreen"]');
+            if (fsPlyrBtn && fsPlyrBtn.parentElement) {
+              webfsBtn = document.createElement('button');
+              webfsBtn.type = 'button';
+              webfsBtn.className = 'plyr__control tb-webfs-btn';
+              webfsBtn.setAttribute('aria-label', '网页全屏');
+              webfsBtn.title = '网页全屏 (W)';
+              webfsBtn.dataset.state = isWebFs() ? 'on' : 'off';
+              webfsBtn.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M4 4h6v2H6v4H4V4zm10 0h6v6h-2V6h-4V4zM4 14h2v4h4v2H4v-6zm14 0h2v6h-6v-2h4v-4z"/></svg>';
+              webfsBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                toggleWebFs();
+              });
+              fsPlyrBtn.parentElement.insertBefore(webfsBtn, fsPlyrBtn);
+            }
+          } catch (_) {}
+        };
+        setupWebFsButton();
+        player.on('ready', setupWebFsButton);
 
         if (activeKeyHandler) {
           document.removeEventListener('keydown', activeKeyHandler, true);
@@ -458,6 +531,18 @@
               e.stopPropagation();
               player.fullscreen.toggle();
               break;
+            case 'KeyW':
+              e.preventDefault();
+              e.stopPropagation();
+              toggleWebFs();
+              break;
+            case 'Escape':
+              if (isWebFs()) {
+                e.preventDefault();
+                e.stopPropagation();
+                toggleWebFs(false);
+              }
+              break;
           }
         };
         activeKeyHandler = onKey;
@@ -469,12 +554,17 @@
           root,
           video,
           player,
+          isWebFs,
+          toggleWebFs,
           destroy() {
             try { player.destroy(); } catch (e) {}
             if (activeKeyHandler) {
               document.removeEventListener('keydown', activeKeyHandler, true);
               activeKeyHandler = null;
             }
+            root.classList.remove('tb-webfs');
+            const ws = document.getElementById(WEBFS_CSS_ID);
+            if (ws) ws.remove();
             const st = document.getElementById(CSS_ID);
             if (st) st.remove();
             if (globalThis[NS] === instance) globalThis[NS] = null;
@@ -488,7 +578,8 @@
               duration: video.duration,
               muted: video.muted,
               volume: video.volume,
-              rate: video.playbackRate
+              rate: video.playbackRate,
+              webfs: isWebFs()
             };
           },
           run: (newArgs) => mountPlyr(newArgs)
@@ -498,7 +589,7 @@
         globalThis[NS] = instance;
         globalThis['__hsPlayerReplacer'] = instance;
 
-        console.log("%c[沪上插班生播放器替换] 已用开源播放器 Plyr 接管原始 <video>（去水印与全键盘快捷键已就绪）！", "color: #10b981; font-weight: bold;");
+        console.log("%c[沪上插班生播放器替换] 已用开源播放器 Plyr 接管原始 <video>（网页全屏 + 去水印 + 全键盘快捷键已就绪）！", "color: #10b981; font-weight: bold;");
 
         return {
           ok: true,
@@ -510,7 +601,7 @@
             plyr_wrapper: !!root.querySelector('.plyr'),
             hidden_page_controls: HIDE_SELECTORS,
             preserved: ['video#myVideo (原生 <video>/HLS)', '.Back-btn-top (返回导航)'],
-            controls: ['大播放按钮', '播放/暂停', '进度拖拽', '时间', '音量/静音', '倍速', '画中画', '全屏']
+            controls: ['大播放按钮', '播放/暂停', '进度拖拽', '时间', '音量/静音', '倍速', '画中画', '网页全屏', '全屏']
           },
           warnings: []
         };
