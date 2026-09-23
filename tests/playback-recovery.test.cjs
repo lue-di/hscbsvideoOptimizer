@@ -15,6 +15,7 @@ function harness({ src = 'blob:lesson', buffer = [], frames = false, fallback = 
   let sequence = 0;
   const timers = new Map();
   const callbacks = new Map();
+  const visibilitySubscribers = new Set();
   const listeners = new Map();
   const events = () => {
     const map = new Map();
@@ -46,7 +47,7 @@ function harness({ src = 'blob:lesson', buffer = [], frames = false, fallback = 
     video.cancelVideoFrameCallback = id => callbacks.delete(id);
   }
   const context = vm.createContext({
-    performance: { now: () => now }, document, Date,
+    performance: { now: () => now }, document, Date, visibilitySubscribers,
     navigator: { get onLine() { return online; } },
     console: { warn() {} }, playingVideos: new WeakSet(),
     isRealHidden: () => hidden, pickVideo: () => video,
@@ -59,7 +60,12 @@ function harness({ src = 'blob:lesson', buffer = [], frames = false, fallback = 
   const recovery = context.createPlaybackRecovery(video, fallback);
   return {
     video, recovery, seeks, callbacks, document,
-    hidden(value) { hidden = value; }, online(value) { online = value; },
+    hidden(value) { hidden = value; for (const fn of visibilitySubscribers) fn(value); },
+    online(value) { online = value; },
+    frame(mediaTime = position) {
+      const entry = callbacks.entries().next().value;
+      if (entry) { callbacks.delete(entry[0]); entry[1](now, { mediaTime }); }
+    },
     tick(seconds, advance = 0) {
       for (let i = 0; i < seconds; i++) {
         now += 1000; position += advance;
@@ -132,15 +138,61 @@ test('switching source during reload never restores old lesson position', () => 
 
 test('destroy cancels pending reload, frame callbacks and watchdog', () => {
   const h = harness({ src: 'https://example.test/lesson.mp4', frames: true }); h.tick(12);
-  assert.equal(h.callbacks.size, 1); h.recovery.destroy();
+  // load() 的 emptied 事件现在会立即撤销旧帧回调。
+  assert.equal(h.callbacks.size, 0); h.recovery.destroy();
   assert.equal(h.callbacks.size, 0); h.video.emit('loadedmetadata'); h.tick(60);
   assert.equal(h.video.plays, 0); assert.equal(h.video.loads, 1);
+});
+
+test('cancelled frame callbacks cannot overwrite a new foreground monitor', () => {
+  const h = harness({ frames: true, buffer: [[0, 90]] }); h.tick(1, 1);
+  const oldCallback = [...h.callbacks.values()][0];
+  h.hidden(true); h.hidden(false);
+  oldCallback(999999, { mediaTime: 999999 });
+  h.tick(2, 1); assert.equal(h.seeks.length, 1);
+  h.recovery.destroy(); assert.equal(h.callbacks.size, 0);
 });
 
 test('frame stall recovery is bounded and requires advancing media time', () => {
   const h = harness({ frames: true, buffer: [[0, 90]] }); h.tick(4, 1);
   assert.equal(h.seeks.length, 1);
-  h.tick(14, 1); assert.equal(h.seeks.length, 1);
+  h.tick(30, 1); assert.equal(h.seeks.length, 2);
+  assert.equal(h.video.loads, 0); assert.equal(h.video.paused, false);
+});
+
+test('each foreground return can recover frozen blob frames without spending network budget', () => {
+  const h = harness({ frames: true, buffer: [[0, 90]] });
+  for (let i = 0; i < 3; i++) {
+    h.hidden(true); h.tick(2, 1);
+    const count = h.seeks.length;
+    h.hidden(false); h.tick(2, 1);
+    assert.equal(h.seeks.length, count + 1);
+    assert.equal(h.video.paused, false);
+  }
+  assert.equal(h.video.loads, 0); assert.equal(h.recovery.state().attempts, 0);
+});
+
+test('healthy foreground frames do not seek and clear previous frame recovery budget', () => {
+  const h = harness({ frames: true, buffer: [[0, 90]] });
+  h.tick(4, 1); assert.equal(h.recovery.state().frames.attempts, 1);
+  for (let i = 0; i < 3; i++) { h.tick(1, 1); h.frame(); }
+  assert.equal(h.recovery.state().frames.attempts, 0);
+  h.hidden(true); h.tick(3, 1); h.hidden(false);
+  for (let i = 0; i < 10; i++) { h.tick(1, 1); h.frame(); }
+  assert.equal(h.seeks.length, 1);
+});
+
+test('returning while paused never resumes or seeks; destroy removes visibility listener', () => {
+  const h = harness({ frames: true, buffer: [[0, 90]] });
+  h.video.paused = true; h.hidden(true); h.tick(3); h.hidden(false); h.tick(5);
+  assert.equal(h.seeks.length, 0); assert.equal(h.video.plays, 0);
+  h.recovery.destroy(); h.hidden(true); h.hidden(false);
+  assert.equal(h.callbacks.size, 0);
+});
+
+test('frame recovery does not seek outside buffer or reload an unbuffered stream', () => {
+  const h = harness({ frames: true }); h.tick(30, 1);
+  assert.equal(h.seeks.length, 0); assert.equal(h.video.loads, 0);
 });
 
 test('reload timeout clears late metadata handler', () => {

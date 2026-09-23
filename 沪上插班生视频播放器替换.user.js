@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         沪上插班生视频播放器替换
 // @namespace    https://wq.bunanguo.com/
-// @version      1.4.0
+// @version      1.4.1
 // @description  使用 Plyr 接管沪上插班生播放器，保留原视频地址，原生 HLS 解析失败时尝试 hls.js 回退，支持卡顿恢复、网页全屏、快捷键、去水印与后台播放
 // @author       zhujunxi
 // @license      GPL-3.0-or-later
@@ -83,9 +83,13 @@
     const origDocAddEventListener = nativeDoc.addEventListener;
     // 捕获阶段已经阻止后台事件；不包装监听器，以保持 removeEventListener 正常工作。
 
+    const visibilitySubscribers = new Set();
     const blockVis = (e) => {
       try {
-        if (isRealHidden()) {
+        const hidden = isRealHidden();
+        // 在阻断页面后台事件之前通知自己的监控，不能依赖已伪装的 document.hidden。
+        for (const listener of visibilitySubscribers) listener(hidden);
+        if (hidden) {
           e.stopImmediatePropagation();
         }
       } catch (_) {}
@@ -337,6 +341,13 @@
       let attempts = 0;
       let healthySince = null;
       let pendingReload = null;
+      let wasHidden = isRealHidden();
+      let foregroundUntil = 0;
+      let frameAttempts = 0;
+      let lastFrameAttempt = -Infinity;
+      let frameGeneration = 0;
+      let renderedTime = null;
+      let goodFrames = 0;
       const history = [];
       const listeners = [];
       const ranges = () => Array.from({ length: video.buffered.length }, (_, i) =>
@@ -349,6 +360,8 @@
           video.currentSrc.startsWith('blob:') ? 'blob/MSE' : /\.m3u8(?:[?#]|$)/i.test(video.currentSrc) ? 'HLS' : 'url',
         hls: hlsFallback ? hlsFallback.state() : null,
         buffered: ranges(), attempts, reloading: !!pendingReload,
+        frames: { supported: !!video.requestVideoFrameCallback, attempts: frameAttempts,
+          hidden: wasHidden, lastFrameAgoMs: Math.round(performance.now() - lastFrame) },
         history: history.map(item => ({ ...item }))
       });
       function record(action) {
@@ -366,6 +379,27 @@
         frameTime = lastTime;
         lastProgress = lastFrame = performance.now();
       }
+      function resetFrameTracking() {
+        frameGeneration++;
+        if (frameId !== null && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(frameId);
+        frameId = null;
+        renderedTime = null;
+        goodFrames = 0;
+        baseline();
+      }
+      function onVisibility(hidden) {
+        if (disposed || hidden === wasHidden) return;
+        wasHidden = hidden;
+        resetFrameTracking();
+        if (!hidden) {
+          frameAttempts = 0;
+          lastFrameAttempt = -Infinity;
+          foregroundUntil = performance.now() + 10000;
+          record('foreground-frame-check');
+          if (!video.paused && !video.ended) trackFrame();
+        }
+      }
+      visibilitySubscribers.add(onVisibility);
       function cancelReload() {
         if (!pendingReload) return;
         clearTimeout(pendingReload.timer);
@@ -379,13 +413,47 @@
       document.addEventListener('keydown', onUserInput, true);
       function trackFrame() {
         if (disposed || frameId !== null || !video.requestVideoFrameCallback) return;
+        const generation = frameGeneration;
         frameId = video.requestVideoFrameCallback((now, metadata) => {
+          if (disposed || generation !== frameGeneration) return;
           frameId = null;
-          if (disposed) return;
-          lastFrame = now;
-          frameTime = metadata.mediaTime;
-          if (!video.paused && !video.ended) trackFrame();
+          // 回调触发不等于画面推进：相同时间戳的旧帧不算恢复。
+          if (renderedTime === null || metadata.mediaTime > renderedTime + 0.001) {
+            lastFrame = now;
+            frameTime = metadata.mediaTime;
+            if (!isRealHidden() && Math.abs(video.currentTime - frameTime) < 1) {
+              goodFrames++;
+              if (goodFrames >= 3 && frameAttempts) {
+                frameAttempts = 0;
+                record('frames-resumed');
+              }
+            } else goodFrames = 0;
+          } else goodFrames = 0;
+          renderedTime = metadata.mediaTime;
+          if (!video.paused && !video.ended && !isRealHidden()) trackFrame();
         });
+      }
+      function recoverFrames() {
+        const now = performance.now();
+        if (disposed || !video.isConnected || video !== pickVideo() || video.paused || video.ended ||
+            video.seeking || video.error || video.readyState < 2 || isRealHidden() || pendingReload ||
+            frameAttempts >= 2 || now - lastFrameAttempt < 4000) return false;
+        const cur = video.currentTime;
+        const range = ranges().find(([start, end]) => start <= cur && end > cur);
+        if (!range) return false;
+        // 40/120ms 分级微跳，只用当前缓冲；不暂停，不调用 load，不重建 HLS。
+        const delta = frameAttempts === 0 ? 0.04 : 0.12;
+        const target = cur + delta < range[1] - 0.02 ? cur + delta : cur - delta;
+        if (target < range[0] + 0.02 || target >= range[1] - 0.02) return false;
+        try {
+          video.currentTime = target;
+          frameAttempts++;
+          lastFrameAttempt = now;
+          record('frame-resync-seek');
+          resetFrameTracking();
+          trackFrame();
+          return true;
+        } catch (_) { return false; }
       }
       function recover(reason) {
         const now = performance.now();
@@ -453,7 +521,8 @@
       listen('seeked', baseline);
       listen('emptied', () => {
         if (!pendingReload) { attempts = 0; playingVideos.delete(video); }
-        baseline();
+        frameAttempts = 0;
+        resetFrameTracking();
       });
       for (const event of ['waiting', 'stalled', 'error']) listen(event, () => record(event));
       const timer = setInterval(() => {
@@ -462,12 +531,14 @@
         const now = performance.now();
         const delayed = now - lastTick > 5000;
         lastTick = now;
+        onVisibility(isRealHidden());
         if (source !== video.currentSrc && !pendingReload) {
           source = video.currentSrc;
           attempts = 0;
           lastAttempt = -Infinity;
           healthySince = null;
-          baseline();
+          frameAttempts = 0;
+          resetFrameTracking();
         }
         if (disposed || !video.isConnected || video !== pickVideo() || video.paused ||
             video.ended || video.seeking || isRealHidden() || delayed || navigator.onLine === false) {
@@ -484,14 +555,16 @@
         } else healthySince = null;
         lastTime = video.currentTime;
         if (now - lastProgress >= 12000) recover('playback-stalled');
-        else if (video.requestVideoFrameCallback && now - lastFrame >= 4000 &&
-            video.currentTime - frameTime > 1 && video.readyState >= 2) recover('frames-stalled');
+        else if (video.requestVideoFrameCallback && now - lastFrame >= (now < foregroundUntil ? 1500 : 4000) &&
+            video.currentTime - frameTime > 0.5 && video.readyState >= 2) recoverFrames();
       }, 1000);
       return {
         state, retry: () => recover('manual-retry'),
         destroy() {
           disposed = true;
           clearInterval(timer);
+          visibilitySubscribers.delete(onVisibility);
+          frameGeneration++;
           cancelReload();
           container.removeEventListener('pointerdown', onUserInput, true);
           document.removeEventListener('keydown', onUserInput, true);
