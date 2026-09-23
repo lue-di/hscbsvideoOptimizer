@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         沪上插班生视频播放器替换
 // @namespace    https://wq.bunanguo.com/
-// @version      1.2.0
+// @version      1.3.0
 // @description  在沪上插班生 (wq.bunanguo.com) 播放视频时，使用开源播放器 Plyr 接管原生播放器，保留原视频源与 HLS 解码管线，自动隐藏视频水印与原生冗余控件，支持网页全屏、丰富快捷键、后台防暂停与切屏音画防假死同步
 // @author       zhujunxi
 // @license      GPL-3.0-or-later
@@ -18,6 +18,13 @@
 
   // 将主逻辑封装为一个可以在主页面（Main World）中直接执行的函数
   function mainWorldWorker() {
+    if (!document.documentElement) {
+      const ready = new MutationObserver(() => {
+        if (document.documentElement) { ready.disconnect(); mainWorldWorker(); }
+      });
+      ready.observe(document, { childList: true });
+      return;
+    }
     if (window.__hsPlayerReplacerInjected) return;
     window.__hsPlayerReplacerInjected = true;
 
@@ -74,17 +81,7 @@
     } catch (_) {}
 
     const origDocAddEventListener = nativeDoc.addEventListener;
-    nativeDoc.addEventListener = function (type, listener, options) {
-      if (type === "visibilitychange") {
-        const wrappedListener = function (e) {
-          if (!isRealHidden()) {
-            return typeof listener === "function" ? listener.call(this, e) : listener.handleEvent(e);
-          }
-        };
-        return origDocAddEventListener.call(this, type, wrappedListener, options);
-      }
-      return origDocAddEventListener.apply(this, arguments);
-    };
+    // 捕获阶段已经阻止后台事件；不包装监听器，以保持 removeEventListener 正常工作。
 
     const blockVis = (e) => {
       try {
@@ -98,32 +95,32 @@
 
     const origMediaPause = HTMLMediaElement.prototype.pause;
     HTMLMediaElement.prototype.pause = function (...args) {
-      if (isRealHidden()) {
-        console.log("%c[沪上插班生播放器替换] 成功拦截网页在后台尝试触发的 pause()！", "color: #10b981; font-weight: bold;");
-        return Promise.resolve();
+      if (isRealHidden() && this === pickVideo() && this.isConnected &&
+          playingVideos.has(this) && !this.ended && !this.error) {
+        return;
       }
       return origMediaPause.apply(this, args);
     };
 
-    let wasPlaying = false;
+    const playingVideos = new WeakSet();
     function pickVideo() {
       return document.querySelector("#VideoView video") || document.querySelector("video.uni-video-video") || document.querySelector("video");
     }
 
     origDocAddEventListener.call(nativeDoc, "play", (e) => {
       if (e.target && e.target.tagName === "VIDEO") {
-        wasPlaying = true;
+        playingVideos.add(e.target);
       }
     }, true);
 
     origDocAddEventListener.call(nativeDoc, "pause", (e) => {
       if (e.target && e.target.tagName === "VIDEO") {
         if (!isRealHidden()) {
-          wasPlaying = false;
-        } else if (wasPlaying) {
+          playingVideos.delete(e.target);
+        } else if (playingVideos.has(e.target)) {
           setTimeout(() => {
             const v = e.target;
-            if (v && v.paused && !v.ended) {
+            if (v === pickVideo() && v.isConnected && playingVideos.has(v) && v.paused && !v.ended && !v.error) {
               v.play().catch(() => {});
             }
           }, 50);
@@ -132,78 +129,187 @@
     }, true);
 
     setInterval(() => {
-      if (isRealHidden() && wasPlaying) {
+      if (isRealHidden()) {
         const v = pickVideo();
-        if (v && v.paused && !v.ended && v.readyState >= 2) {
+        if (v && playingVideos.has(v) && v.paused && !v.ended && !v.error && v.readyState >= 2) {
           v.play().catch(() => {});
         }
       }
     }, 800);
 
-    // ---- 6. 切回前台音画重同步与画面假死自动自愈看门狗 ----
-    function wakeUpVideoDecoder(v) {
-      if (!v || v.paused || v.ended || v.readyState < 2) return;
-      try {
-        const cur = v.currentTime;
-        if (Number.isFinite(cur)) {
-          const delta = (v.duration && cur + 0.001 >= v.duration) ? -0.001 : 0.001;
-          v.currentTime = cur + delta;
-        }
-      } catch (_) {}
-    }
-
-    let lastHiddenState = isRealHidden();
-    function onForegroundResync() {
-      const v = pickVideo();
-      if (!v || v.paused || v.ended) return;
-      setTimeout(() => wakeUpVideoDecoder(v), 40);
-      setTimeout(() => wakeUpVideoDecoder(v), 250);
-    }
-
-    window.addEventListener("focus", onForegroundResync, true);
-    window.addEventListener("pageshow", onForegroundResync, true);
-    origDocAddEventListener.call(nativeDoc, "visibilitychange", () => {
-      const nowHidden = isRealHidden();
-      if (lastHiddenState && !nowHidden) {
-        onForegroundResync();
+    // ---- 6. 每个播放器独立的卡顿监控：先修复缓冲间隙，再有限重载直连媒体 ----
+    function createPlaybackRecovery(video) {
+      let disposed = false;
+      let frameId = null;
+      let source = video.currentSrc;
+      let lastTime = video.currentTime;
+      let lastProgress = performance.now();
+      let lastFrame = lastProgress;
+      let frameTime = lastTime;
+      let lastTick = lastProgress;
+      let lastAttempt = -Infinity;
+      let attempts = 0;
+      let healthySince = null;
+      let pendingReload = null;
+      const history = [];
+      const listeners = [];
+      const ranges = () => Array.from({ length: video.buffered.length }, (_, i) =>
+        [video.buffered.start(i), video.buffered.end(i)]);
+      const state = () => ({
+        currentTime: video.currentTime, paused: video.paused, seeking: video.seeking,
+        readyState: video.readyState, networkState: video.networkState,
+        errorCode: video.error ? video.error.code : null,
+        sourceType: video.srcObject ? 'stream' : video.currentSrc.startsWith('blob:') ? 'blob/MSE' : 'url',
+        buffered: ranges(), attempts, reloading: !!pendingReload,
+        history: history.map(item => ({ ...item }))
+      });
+      function record(action) {
+        history.push({ action, time: new Date().toISOString(), position: video.currentTime,
+          readyState: video.readyState, networkState: video.networkState,
+          errorCode: video.error ? video.error.code : null });
+        if (history.length > 20) history.shift();
       }
-      lastHiddenState = nowHidden;
-    }, true);
-
-    if (typeof HTMLVideoElement !== "undefined" && "requestVideoFrameCallback" in HTMLVideoElement.prototype) {
-      let lastPaintTime = performance.now();
-      let lastMediaTime = 0;
-      let rvfcPending = false;
-
-      function trackVideoFrames(v) {
-        if (!v || rvfcPending) return;
-        rvfcPending = true;
-        try {
-          v.requestVideoFrameCallback((now, metadata) => {
-            rvfcPending = false;
-            lastPaintTime = now;
-            lastMediaTime = metadata.mediaTime;
-            if (!v.paused && !v.ended) {
-              trackVideoFrames(v);
-            }
-          });
-        } catch (_) {
-          rvfcPending = false;
-        }
+      function listen(type, handler) {
+        video.addEventListener(type, handler);
+        listeners.push([type, handler]);
       }
-
-      setInterval(() => {
-        if (isRealHidden()) return;
-        const v = pickVideo();
-        if (!v || v.paused || v.ended || v.readyState < 2) return;
-        trackVideoFrames(v);
+      function baseline() {
+        lastTime = video.currentTime;
+        frameTime = lastTime;
+        lastProgress = lastFrame = performance.now();
+      }
+      function cancelReload() {
+        if (!pendingReload) return;
+        clearTimeout(pendingReload.timer);
+        video.removeEventListener('loadedmetadata', pendingReload.restore);
+        pendingReload = null;
+      }
+      // 重载等待期间用户操作优先，避免稍后强制恢复用户刚暂停/拖动的视频。
+      const onUserInput = () => { if (pendingReload) { cancelReload(); record('reload-cancelled-by-user'); } };
+      const container = video.closest('#VideoView') || video;
+      container.addEventListener('pointerdown', onUserInput, true);
+      document.addEventListener('keydown', onUserInput, true);
+      function trackFrame() {
+        if (disposed || frameId !== null || !video.requestVideoFrameCallback) return;
+        frameId = video.requestVideoFrameCallback((now, metadata) => {
+          frameId = null;
+          if (disposed) return;
+          lastFrame = now;
+          frameTime = metadata.mediaTime;
+          if (!video.paused && !video.ended) trackFrame();
+        });
+      }
+      function recover(reason) {
         const now = performance.now();
-        if (now - lastPaintTime > 1500 && Math.abs(v.currentTime - lastMediaTime) > 0.8) {
-          wakeUpVideoDecoder(v);
-          lastPaintTime = now;
-          lastMediaTime = v.currentTime;
+        if (disposed || !video.isConnected || video !== pickVideo() || video.paused ||
+            video.ended || video.seeking || isRealHidden() || navigator.onLine === false ||
+            pendingReload || attempts >= 3 || now - lastAttempt < 15000) return false;
+        attempts++;
+        lastAttempt = now;
+        healthySince = null;
+        record(reason);
+        const cur = video.currentTime;
+        // 不跳到远处：只跨过 <= 0.5 秒的缓冲小间隙，或在已有缓冲内微跳。
+        const buffer = ranges();
+        const next = buffer.find(([start, end]) => start > cur && start - cur <= 0.5 && end - start > 0.1);
+        const covering = buffer.find(([start, end]) => start <= cur && end > cur + 0.1);
+        if (attempts === 1 && !video.error && (next || covering)) {
+          try {
+            video.currentTime = next ? next[0] + 0.01 : cur + 0.01;
+            record('buffer-seek');
+            baseline();
+            return true;
+          } catch (_) {}
         }
+        // blob 通常由站点 HLS/MSE 管线管理，load() 会破坏它；未知流不盲目重载。
+        if (!/^https?:/i.test(video.currentSrc) || video.srcObject || !Number.isFinite(video.duration)) {
+          attempts = 3;
+          record('needs-site-reload');
+          console.warn('[沪上插班生播放器替换] 卡顿未恢复，当前媒体需由平台重新加载。诊断：', state());
+          return false;
+        }
+        const saved = { src: video.currentSrc, position: cur, rate: video.playbackRate,
+          volume: video.volume, muted: video.muted };
+        const restore = () => {
+          cancelReload();
+          if (disposed || !video.isConnected || video !== pickVideo() || video.currentSrc !== saved.src) return;
+          try {
+            video.currentTime = Math.max(0, Math.min(saved.position, video.duration - 0.05));
+            video.playbackRate = saved.rate;
+            video.volume = saved.volume;
+            video.muted = saved.muted;
+            video.play().catch(() => record('resume-rejected'));
+            record('position-restored');
+          } catch (_) { record('restore-failed'); }
+          baseline();
+        };
+        pendingReload = { restore, timer: setTimeout(() => {
+          cancelReload();
+          record('reload-timeout');
+        }, 15000) };
+        video.addEventListener('loadedmetadata', restore);
+        try {
+          record('reload-url');
+          video.load();
+          // 每次卡顿最多一次媒体重载；持续正常播放 30 秒后才重置预算。
+          attempts = 3;
+        } catch (_) {
+          cancelReload();
+          record('reload-failed');
+        }
+        return true;
+      }
+      listen('play', baseline);
+      listen('pause', () => { if (!pendingReload) baseline(); });
+      listen('seeking', () => { healthySince = null; baseline(); });
+      listen('seeked', baseline);
+      listen('emptied', () => {
+        if (!pendingReload) { attempts = 0; playingVideos.delete(video); }
+        baseline();
+      });
+      for (const event of ['waiting', 'stalled', 'error']) listen(event, () => record(event));
+      const timer = setInterval(() => {
+        const now = performance.now();
+        const delayed = now - lastTick > 5000;
+        lastTick = now;
+        if (source !== video.currentSrc && !pendingReload) {
+          source = video.currentSrc;
+          attempts = 0;
+          lastAttempt = -Infinity;
+          healthySince = null;
+          baseline();
+        }
+        if (disposed || !video.isConnected || video !== pickVideo() || video.paused ||
+            video.ended || video.seeking || isRealHidden() || delayed || navigator.onLine === false) {
+          healthySince = null;
+          baseline();
+          return;
+        }
+        trackFrame();
+        const advanced = video.currentTime > lastTime + 0.02;
+        if (advanced) {
+          lastProgress = now;
+          if (healthySince === null) healthySince = now;
+          if (now - healthySince >= 30000 && (!video.requestVideoFrameCallback || now - lastFrame < 4000)) attempts = 0;
+        } else healthySince = null;
+        lastTime = video.currentTime;
+        if (now - lastProgress >= 12000) recover('playback-stalled');
+        else if (video.requestVideoFrameCallback && now - lastFrame >= 4000 &&
+            video.currentTime - frameTime > 1 && video.readyState >= 2) recover('frames-stalled');
       }, 1000);
+      return {
+        state, retry: () => recover('manual-retry'),
+        destroy() {
+          disposed = true;
+          clearInterval(timer);
+          cancelReload();
+          container.removeEventListener('pointerdown', onUserInput, true);
+          document.removeEventListener('keydown', onUserInput, true);
+          if (frameId !== null && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(frameId);
+          for (const [type, handler] of listeners) video.removeEventListener(type, handler);
+          playingVideos.delete(video);
+        }
+      };
     }
 
     /* =========================================================================
@@ -346,23 +452,33 @@
       (document.head || document.documentElement).appendChild(l);
     }
 
+    let libraryPromise = null;
+    let libraryRetryAfter = 0;
     function loadJs(src, id) {
-      return new Promise((resolve, reject) => {
+      if (typeof globalThis.Plyr === 'function') return Promise.resolve();
+      if (libraryPromise) return libraryPromise;
+      libraryPromise = new Promise((resolve, reject) => {
         const existing = document.getElementById(id);
-        if (existing) {
-          if (globalThis.Plyr) return resolve();
-          existing.addEventListener('load', () => resolve());
-          existing.addEventListener('error', () => reject(new Error('script error')));
-          return;
-        }
+        if (existing) existing.remove();
         const s = document.createElement('script');
         s.id = id;
         s.src = src;
         s.async = true;
-        s.addEventListener('load', () => resolve());
-        s.addEventListener('error', () => reject(new Error('script load error')));
+        const finish = (error) => {
+          clearTimeout(timeout);
+          s.onload = s.onerror = null;
+          if (error) { s.remove(); reject(error); } else resolve();
+        };
+        const timeout = setTimeout(() => finish(new Error('Plyr load timeout')), 15000);
+        s.onload = () => finish(typeof globalThis.Plyr === 'function' ? null : new Error('Plyr unavailable'));
+        s.onerror = () => finish(new Error('Plyr load error'));
         (document.head || document.documentElement).appendChild(s);
+      }).catch(error => {
+        libraryPromise = null;
+        libraryRetryAfter = Date.now() + 30000;
+        throw error;
       });
+      return libraryPromise;
     }
 
     function ensurePlayerStyle() {
@@ -427,8 +543,6 @@
 
     // 立即发起样式和库的预加载
     ensureCss(PLYR_CSS, PLYR_CSS_ID);
-    ensurePlayerStyle();
-    ensureWebFsStyle();
     loadJs(PLYR_JS, PLYR_JS_ID).catch(() => {});
 
     let currentInstance = null;
@@ -436,7 +550,7 @@
     let activeKeyHandler = null;
 
     async function mountPlyr(args) {
-      if (isMounting) return;
+      if (isMounting || Date.now() < libraryRetryAfter) return;
       const root = document.querySelector('#VideoView');
       if (!root) {
         return { ok: false, summary: '未找到播放器容器 #VideoView', warnings: ['target_not_found'] };
@@ -484,10 +598,11 @@
         if (!globalThis.Plyr || typeof globalThis.Plyr !== 'function') {
           return { ok: false, summary: 'Plyr 未就绪', warnings: ['library_not_ready'] };
         }
+        // CDN 加载期间可能已经切课，不能接管过期的视频节点。
+        if (!root.isConnected || root.querySelector('video') !== video ||
+            document.querySelector('#VideoView') !== root) return;
 
-        ensurePlayerStyle();
-        ensureWebFsStyle();
-
+        const previousRate = video.playbackRate;
         const player = new globalThis.Plyr(video, {
           controls: [
             'play-large',
@@ -502,7 +617,7 @@
             'fullscreen'
           ],
           settings: ['speed'],
-          speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
+          speed: { selected: previousRate, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
           seekTime: 10,
           hideControls: true,
           tooltips: { controls: true, seek: true },
@@ -519,7 +634,11 @@
             pip: '画中画'
           }
         });
-        player.speed = 1;
+        player.speed = previousRate;
+        ensurePlayerStyle();
+        ensureWebFsStyle();
+        const recovery = createPlaybackRecovery(video);
+        if (!video.paused) playingVideos.add(video);
 
         // ---------- 网页全屏（铺满浏览器视口，非系统全屏 API） ----------
         const isWebFs = () => root.classList.contains('tb-webfs');
@@ -622,9 +741,11 @@
           root,
           video,
           player,
+          recovery,
           isWebFs,
           toggleWebFs,
           destroy() {
+            recovery.destroy();
             try { player.destroy(); } catch (e) {}
             if (activeKeyHandler) {
               document.removeEventListener('keydown', activeKeyHandler, true);
@@ -647,7 +768,8 @@
               muted: video.muted,
               volume: video.volume,
               rate: video.playbackRate,
-              webfs: isWebFs()
+              webfs: isWebFs(),
+              recovery: recovery.state()
             };
           },
           run: (newArgs) => mountPlyr(newArgs)
@@ -679,20 +801,23 @@
     }
 
     // 监听 DOM 变动与轮询检测，以在 SPA 路由切换、进入视频页时自动接管
-    const observer = new MutationObserver(() => {
+    function checkPlayer() {
       const v = document.querySelector('#VideoView video');
-      if (v && (!v.plyr || (currentInstance && currentInstance.video !== v))) {
-        mountPlyr();
+      if (currentInstance && (!currentInstance.video.isConnected || !v)) currentInstance.destroy();
+      if (v && (!v.plyr || !currentInstance || currentInstance.video !== v)) {
+        mountPlyr().catch(error => console.warn('[沪上插班生播放器替换] 接管失败:', error));
       }
+    }
+    let checkQueued = false;
+    const observer = new MutationObserver(() => {
+      if (checkQueued) return;
+      checkQueued = true;
+      setTimeout(() => { checkQueued = false; checkPlayer(); }, 100);
     });
     observer.observe(document.documentElement, { childList: true, subtree: true });
 
-    setInterval(() => {
-      const v = document.querySelector('#VideoView video');
-      if (v && (!v.plyr || (currentInstance && currentInstance.video !== v))) {
-        mountPlyr();
-      }
-    }, 1200);
+    setInterval(checkPlayer, 1200);
+    checkPlayer();
 
     /* =========================================================================
      * 第四部分：页面提示与初始化通知
