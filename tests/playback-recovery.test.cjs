@@ -5,10 +5,10 @@ const vm = require('node:vm');
 const path = require('node:path');
 
 const script = fs.readFileSync(path.join(__dirname, '../沪上插班生视频播放器替换.user.js'), 'utf8');
-const start = script.indexOf('    function createPlaybackRecovery(video) {');
+const start = script.indexOf('    function createPlaybackRecovery(');
 const end = script.indexOf('\n    /* ===', start);
 
-function harness({ src = 'blob:lesson', buffer = [], frames = false } = {}) {
+function harness({ src = 'blob:lesson', buffer = [], frames = false, fallback = null } = {}) {
   let now = 0;
   let hidden = false;
   let online = true;
@@ -56,7 +56,7 @@ function harness({ src = 'blob:lesson', buffer = [], frames = false } = {}) {
     clearTimeout(id) { timers.delete(id); }
   });
   vm.runInContext(script.slice(start, end), context);
-  const recovery = context.createPlaybackRecovery(video);
+  const recovery = context.createPlaybackRecovery(video, fallback);
   return {
     video, recovery, seeks, callbacks, document,
     hidden(value) { hidden = value; }, online(value) { online = value; },
@@ -73,6 +73,13 @@ function harness({ src = 'blob:lesson', buffer = [], frames = false } = {}) {
 test('normal playback never seeks or reloads', () => {
   const h = harness(); h.tick(60, 1);
   assert.equal(h.seeks.length, 0); assert.equal(h.video.loads, 0);
+});
+
+test('HLS failure check runs even when the media element is paused after error', () => {
+  let checks = 0;
+  const h = harness({ fallback: { check() { checks++; }, state: () => ({ status: 'native' }) } });
+  h.video.paused = true; h.video.error = { code: 4 }; h.tick(1);
+  assert.equal(checks, 1); assert.equal(h.recovery.state().hls.status, 'native');
 });
 
 test('12 second stall skips only a small buffered gap and respects cooldown', () => {

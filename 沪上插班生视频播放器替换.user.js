@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         沪上插班生视频播放器替换
 // @namespace    https://wq.bunanguo.com/
-// @version      1.3.0
-// @description  在沪上插班生 (wq.bunanguo.com) 播放视频时，使用开源播放器 Plyr 接管原生播放器，保留原视频源与 HLS 解码管线，自动隐藏视频水印与原生冗余控件，支持网页全屏、丰富快捷键、后台防暂停与切屏音画防假死同步
+// @version      1.4.0
+// @description  使用 Plyr 接管沪上插班生播放器，保留原视频地址，原生 HLS 解析失败时尝试 hls.js 回退，支持卡顿恢复、网页全屏、快捷键、去水印与后台播放
 // @author       zhujunxi
 // @license      GPL-3.0-or-later
 // @match        *://wq.bunanguo.com/*
@@ -137,8 +137,194 @@
       }
     }, 800);
 
+    // 模块导入不会覆盖站点自己的 window.Hls，也不复用未知版本的站点实例。
+    let hlsLibraryPromise = null;
+    function loadHlsLibrary() {
+      if (hlsLibraryPromise) return hlsLibraryPromise;
+      hlsLibraryPromise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('hls-library-timeout')), 15000);
+        import('https://cdn.jsdelivr.net/npm/hls.js@1.6.13/dist/hls.mjs').then(module => {
+          clearTimeout(timer);
+          resolve(module.default);
+        }, () => {
+          clearTimeout(timer);
+          reject(new Error('hls-library-unavailable'));
+        });
+      }).catch(error => { hlsLibraryPromise = null; throw error; });
+      return hlsLibraryPromise;
+    }
+
+    // 仅对原生 .m3u8 的不支持/解析错误回退；不接管已有 blob/MSE 或 MediaStream。
+    function createHlsFallback(video, loadLibrary = loadHlsLibrary) {
+      let disposed = false;
+      let loading = false;
+      let generation = 0;
+      let hls = null;
+      let ownedSrc = '';
+      let originalSrc = '';
+      let resume = false;
+      let saved = null;
+      let mediaRecoveries = 0;
+      let status = 'native';
+      let lastError = null;
+      let timeout = null;
+      const attempted = new Set();
+      const history = [];
+      const attached = () => video.isConnected && video === pickVideo();
+      const isHlsUrl = src => /^https?:/i.test(src) && /\.m3u8(?:[?#]|$)/i.test(src);
+      const record = action => {
+        history.push({ action, time: new Date().toISOString() });
+        if (history.length > 20) history.shift();
+      };
+      function release(restoreSource = false) {
+        clearTimeout(timeout);
+        timeout = null;
+        const instance = hls;
+        const ours = !!instance && video.src === ownedSrc;
+        hls = null;
+        saved = null;
+        resume = false;
+        if (instance) {
+          try { instance.destroy(); } catch (_) {}
+          if (restoreSource && ours && !video.srcObject) video.src = originalSrc;
+        }
+        ownedSrc = '';
+      }
+      function fail(action) {
+        clearTimeout(timeout);
+        timeout = null;
+        status = 'failed';
+        resume = false;
+        saved = null;
+        if (hls) { try { hls.stopLoad(); } catch (_) {} }
+        record(action);
+      }
+      async function start(src) {
+        loading = true;
+        const token = ++generation;
+        attempted.add(src);
+        if (attempted.size > 20) attempted.delete(attempted.values().next().value);
+        status = 'loading-library';
+        lastError = null;
+        saved = { position: video.currentTime, rate: video.playbackRate,
+          volume: video.volume, muted: video.muted };
+        resume = !video.paused;
+        record('native-hls-parse-failed');
+        try {
+          const Hls = await loadLibrary();
+          if (disposed || token !== generation || !attached() || video.srcObject ||
+              video.src !== src || (video.currentSrc && video.currentSrc !== src) ||
+              video.error?.code !== 4) return;
+          if (!Hls.isSupported()) { fail('mse-unsupported'); return; }
+          originalSrc = src;
+          mediaRecoveries = 0;
+          // 用标准加载策略的有限重试；不对 403、无效清单等做无限重连。
+          const instance = new Hls({ backBufferLength: 60, startPosition: saved?.position || -1 });
+          hls = instance;
+          status = 'attaching';
+          const current = () => !disposed && hls === instance && attached() &&
+            video.src === ownedSrc && !video.srcObject;
+          instance.on(Hls.Events.MEDIA_ATTACHED, () => {
+            if (!current()) return;
+            status = 'loading-manifest';
+            instance.loadSource(src);
+          });
+          instance.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (!current()) return;
+            status = 'buffering';
+            record('manifest-parsed');
+          });
+          instance.on(Hls.Events.ERROR, (_, data) => {
+            if (!current()) return;
+            // 仅枚举和状态码，避免将带签名 URL、响应正文、密钥写入诊断。
+            const label = value => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,80}$/.test(value) ? value : 'unknown';
+            lastError = { type: label(data.type), details: label(data.details), fatal: !!data.fatal,
+              httpStatus: Number.isInteger(data.response?.code) ? data.response.code : null };
+            record(data.fatal ? 'hls-fatal-error' : 'hls-retrying');
+            if (!data.fatal) return;
+            if (data.type === Hls.ErrorTypes.MEDIA_ERROR && video.error && mediaRecoveries < 1) {
+              mediaRecoveries++;
+              record('hls-media-recovery');
+              instance.recoverMediaError();
+              ownedSrc = video.src;
+            } else fail('hls-stopped');
+          });
+          timeout = setTimeout(() => { if (hls === instance) fail('hls-start-timeout'); }, 45000);
+          instance.attachMedia(video);
+          ownedSrc = video.src;
+          record('hls-attached');
+        } catch (_) {
+          if (!disposed && token === generation) fail(hls ? 'hls-setup-failed' : 'hls-library-failed');
+        } finally {
+          if (token === generation) {
+            loading = false;
+            if (!hls && status === 'loading-library') { status = 'native'; saved = null; resume = false; }
+          }
+        }
+      }
+      function check() {
+        if (disposed) return;
+        if (hls && (!attached() || video.src !== ownedSrc || video.srcObject)) {
+          generation++;
+          release();
+          status = 'native';
+          record('source-changed');
+        }
+        const src = video.src;
+        if (hls || loading || !attached() || video.srcObject || isRealHidden() || navigator.onLine === false ||
+            !isHlsUrl(src) || (video.currentSrc && video.currentSrc !== src) ||
+            video.error?.code !== 4 || attempted.has(src)) return;
+        void start(src);
+      }
+      function onMetadata() {
+        if (!hls || video.src !== ownedSrc || !saved) return;
+        const position = saved.position;
+        video.playbackRate = saved.rate;
+        video.volume = saved.volume;
+        video.muted = saved.muted;
+        saved = null;
+        if (position > 0 && Number.isFinite(video.duration)) {
+          video.currentTime = Math.max(0, Math.min(position, video.duration - 0.05));
+        }
+      }
+      function onCanPlay() {
+        if (!hls || video.src !== ownedSrc || status === 'failed') return;
+        clearTimeout(timeout);
+        timeout = null;
+        status = 'ready';
+        if (resume) { resume = false; video.play().catch(() => record('resume-rejected')); }
+      }
+      const cancelResume = () => { resume = false; saved = null; };
+      const container = video.closest('#VideoView') || video;
+      video.addEventListener('loadedmetadata', onMetadata);
+      video.addEventListener('canplay', onCanPlay);
+      container.addEventListener('pointerdown', cancelResume, true);
+      document.addEventListener('keydown', cancelResume, true);
+      // 切课时及时释放旧请求；异步加载库期间的换源也会使旧任务失效。
+      const observer = new MutationObserver(() => {
+        if (loading) { generation++; loading = false; saved = null; resume = false; status = 'native'; }
+        check();
+      });
+      observer.observe(video, { attributes: true, attributeFilter: ['src'] });
+      return {
+        check,
+        state: () => ({ status, active: !!hls, library: 'hls.js 1.6.13', mediaRecoveries,
+          lastError: lastError && { ...lastError }, history: history.map(item => ({ ...item })) }),
+        destroy() {
+          disposed = true;
+          generation++;
+          observer.disconnect();
+          video.removeEventListener('loadedmetadata', onMetadata);
+          video.removeEventListener('canplay', onCanPlay);
+          container.removeEventListener('pointerdown', cancelResume, true);
+          document.removeEventListener('keydown', cancelResume, true);
+          release(true);
+        }
+      };
+    }
+
     // ---- 6. 每个播放器独立的卡顿监控：先修复缓冲间隙，再有限重载直连媒体 ----
-    function createPlaybackRecovery(video) {
+    function createPlaybackRecovery(video, hlsFallback = null) {
       let disposed = false;
       let frameId = null;
       let source = video.currentSrc;
@@ -159,7 +345,9 @@
         currentTime: video.currentTime, paused: video.paused, seeking: video.seeking,
         readyState: video.readyState, networkState: video.networkState,
         errorCode: video.error ? video.error.code : null,
-        sourceType: video.srcObject ? 'stream' : video.currentSrc.startsWith('blob:') ? 'blob/MSE' : 'url',
+        sourceType: video.srcObject ? 'stream' : !video.currentSrc ? 'empty' :
+          video.currentSrc.startsWith('blob:') ? 'blob/MSE' : /\.m3u8(?:[?#]|$)/i.test(video.currentSrc) ? 'HLS' : 'url',
+        hls: hlsFallback ? hlsFallback.state() : null,
         buffered: ranges(), attempts, reloading: !!pendingReload,
         history: history.map(item => ({ ...item }))
       });
@@ -269,6 +457,8 @@
       });
       for (const event of ['waiting', 'stalled', 'error']) listen(event, () => record(event));
       const timer = setInterval(() => {
+        // 致命加载错误会使 paused=true；必须在暂停判断之前检查 HLS 回退。
+        if (hlsFallback) hlsFallback.check();
         const now = performance.now();
         const delayed = now - lastTick > 5000;
         lastTick = now;
@@ -637,7 +827,8 @@
         player.speed = previousRate;
         ensurePlayerStyle();
         ensureWebFsStyle();
-        const recovery = createPlaybackRecovery(video);
+        const hlsFallback = createHlsFallback(video);
+        const recovery = createPlaybackRecovery(video, hlsFallback);
         if (!video.paused) playingVideos.add(video);
 
         // ---------- 网页全屏（铺满浏览器视口，非系统全屏 API） ----------
@@ -746,6 +937,7 @@
           toggleWebFs,
           destroy() {
             recovery.destroy();
+            hlsFallback.destroy();
             try { player.destroy(); } catch (e) {}
             if (activeKeyHandler) {
               document.removeEventListener('keydown', activeKeyHandler, true);
@@ -783,7 +975,7 @@
 
         return {
           ok: true,
-          summary: '已用开源播放器 Plyr 接管原始 <video>（保留原有视频源与解码管线）',
+          summary: '已用 Plyr 接管原始 <video>（保留视频地址，原生 HLS 解析失败时尝试回退）',
           changed_count: 1,
           data: {
             library: 'Plyr 3.7.8 (MIT)',
