@@ -102,7 +102,7 @@ test('12 second native HLS stall tries fallback before load or seek', () => {
   h.tick(11); assert.equal(calls, 0);
   h.tick(1); assert.equal(calls, 1);
   assert.equal(h.video.loads, 0); assert.equal(h.seeks.length, 0);
-  assert.equal(h.recovery.state().scriptVersion, '1.4.2');
+  assert.equal(h.recovery.state().scriptVersion, '1.4.3');
 });
 
 test('MSE stall never calls load and stops retrying', () => {
@@ -238,4 +238,47 @@ test('Plyr library load is shared, times out and can retry after failure', async
   context.Plyr = function () {};
   elements.get('lib').onload(); await second;
   assert.equal(timers.size, 0);
+});
+
+
+test('hidden watchdog baselines do not fabricate frame or progress observations', () => {
+  const h = harness({ frames: true });
+  h.tick(1, 1); h.frame();
+  h.hidden(true); h.tick(10);
+  const state = h.recovery.state();
+  assert.equal(state.progressIdleMs, 10000);
+  assert.equal(state.frames.lastFrameAgoMs, 10000);
+  assert.equal(state.frames.monitoring, false);
+  assert.equal(state.recoveryIdleMs, 0);
+});
+
+test('no received frames are reported as unknown, including after a source change', () => {
+  const h = harness({ frames: true }); h.tick(1, 1);
+  assert.equal(h.recovery.state().frames.lastFrameAgoMs, null);
+  h.frame(); h.video.currentSrc = 'blob:next'; h.tick(1);
+  assert.equal(h.recovery.state().frames.lastFrameAgoMs, null);
+  assert.equal(h.recovery.state().progressIdleMs, null);
+});
+
+test('backward seek accepts new frames and clears frame recovery budget', () => {
+  const h = harness({ frames: true, buffer: [[0, 90]] });
+  h.tick(4, 1); h.frame();
+  assert.equal(h.recovery.state().frames.attempts, 1);
+  h.video.seeking = true; h.video.emit('seeking');
+  h.video.currentTime = 2;
+  h.video.seeking = false; h.video.emit('seeked');
+  const seeks = h.seeks.length;
+  for (let i = 0; i < 3; i++) { h.tick(1, 1); h.frame(); }
+  assert.equal(h.recovery.state().frames.attempts, 0);
+  assert.equal(h.seeks.length, seeks);
+});
+
+test('stalled events alone do not trigger recovery while playback advances', () => {
+  const h = harness({ buffer: [[0, 90]] });
+  for (let i = 0; i < 30; i++) { h.video.emit('stalled'); h.tick(1, 1); }
+  assert.equal(h.seeks.length, 0); assert.equal(h.video.loads, 0);
+  const event = h.recovery.state().history.at(-1);
+  assert.equal(event.realHidden, false);
+  assert.equal(event.playbackRate, 1.5);
+  assert.ok(event.bufferAhead > 0);
 });

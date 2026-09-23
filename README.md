@@ -177,6 +177,15 @@ __tbVideoPlayer.recovery.retry();
 
 诊断新增 `scriptVersion`、`realHidden`、`online`、`progressIdleMs` 和 `watchdogIdleMs`。更新油猴脚本后必须刷新已有播放页面，运行 `__tbVideoPlayer.recovery.state().scriptVersion` 应返回 `1.4.2`；缺少该字段说明页面还未运行此版本。
 
+#### 方案 B 1.4.3：修正帧监控与诊断计时
+
+- 拖动开始／结束时撤销旧帧回调，重新建立帧时间基准，避免向后跳转后的新帧继续与跳转前时间比较；保留画面恢复次数限制。
+- `progressIdleMs`、`frames.lastFrameAgoMs` 分别报告最近一次观测到时间轴前进、帧推进后的时间；尚未观测到时为 `null`。后台或暂停重置检测基线不再把这两个值伪装成最近有进度／新帧。
+- `recoveryIdleMs`、`frames.detectionIdleMs` 单独表示恢复检测计时，`frames.monitoring` 表示当前是否有待处理的帧回调。事件历史补充真实可见性、暂停／拖动状态、倍速与缓冲余量。
+- `stalled` 事件本身不触发重载；仍需确认播放进度停滞。已有缓冲且时间轴持续前进时，不因此强制切换 HLS。
+
+更新脚本后刷新播放页面，`__tbVideoPlayer.recovery.state().scriptVersion` 应为 `1.4.3`。本地模拟回归测试不能替代真实浏览器中的解码与切页验证。
+
 ### 3. 视频水印控制器 (`__hsWatermarkRemover`)
 
 两款脚本均内置水印控制器实例 `window.__hsWatermarkRemover`（同时兼容 `window.__tabbit_watermark_remover__`）：

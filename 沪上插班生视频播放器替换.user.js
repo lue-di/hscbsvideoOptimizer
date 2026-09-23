@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         沪上插班生视频播放器替换
 // @namespace    https://wq.bunanguo.com/
-// @version      1.4.2
+// @version      1.4.3
 // @description  使用 Plyr 接管沪上插班生播放器，保留原视频地址，原生 HLS 解析失败时尝试 hls.js 回退，支持卡顿恢复、网页全屏、快捷键、去水印与后台播放
 // @author       zhujunxi
 // @license      GPL-3.0-or-later
@@ -356,6 +356,10 @@
       let lastTime = video.currentTime;
       let lastProgress = performance.now();
       let lastFrame = lastProgress;
+      // 真实观测与恢复计时基线分离：后台/暂停重置检测不能伪造进度或新帧。
+      let observedTime = lastTime;
+      let observedProgressAt = null;
+      let observedFrameAt = null;
       let frameTime = lastTime;
       let lastTick = lastProgress;
       let lastAttempt = -Infinity;
@@ -374,10 +378,11 @@
       const ranges = () => Array.from({ length: video.buffered.length }, (_, i) =>
         [video.buffered.start(i), video.buffered.end(i)]);
       const state = () => ({
-        scriptVersion: '1.4.2',
+        scriptVersion: '1.4.3',
         currentTime: video.currentTime, paused: video.paused, seeking: video.seeking,
         realHidden: isRealHidden(), online: navigator.onLine !== false,
-        progressIdleMs: Math.round(performance.now() - lastProgress),
+        progressIdleMs: observedProgressAt === null ? null : Math.round(performance.now() - observedProgressAt),
+        recoveryIdleMs: Math.round(performance.now() - lastProgress),
         watchdogIdleMs: Math.round(performance.now() - lastTick),
         readyState: video.readyState, networkState: video.networkState,
         errorCode: video.error ? video.error.code : null,
@@ -386,12 +391,17 @@
         hls: hlsFallback ? hlsFallback.state() : null,
         buffered: ranges(), attempts, reloading: !!pendingReload,
         frames: { supported: !!video.requestVideoFrameCallback, attempts: frameAttempts,
-          hidden: wasHidden, lastFrameAgoMs: Math.round(performance.now() - lastFrame) },
+          hidden: wasHidden, monitoring: frameId !== null,
+          lastFrameAgoMs: observedFrameAt === null ? null : Math.round(performance.now() - observedFrameAt),
+          detectionIdleMs: Math.round(performance.now() - lastFrame) },
         history: history.map(item => ({ ...item }))
       });
       function record(action) {
         history.push({ action, time: new Date().toISOString(), position: video.currentTime,
           readyState: video.readyState, networkState: video.networkState,
+          realHidden: isRealHidden(), paused: video.paused, seeking: video.seeking,
+          playbackRate: video.playbackRate,
+          bufferAhead: Math.max(0, (ranges().find(([start, end]) => start <= video.currentTime && end > video.currentTime)?.[1] ?? video.currentTime) - video.currentTime),
           errorCode: video.error ? video.error.code : null });
         if (history.length > 20) history.shift();
       }
@@ -444,6 +454,7 @@
           frameId = null;
           // 回调触发不等于画面推进：相同时间戳的旧帧不算恢复。
           if (renderedTime === null || metadata.mediaTime > renderedTime + 0.001) {
+            observedFrameAt = performance.now();
             lastFrame = now;
             frameTime = metadata.mediaTime;
             if (!isRealHidden() && Math.abs(video.currentTime - frameTime) < 1) {
@@ -547,11 +558,17 @@
       }
       listen('play', baseline);
       listen('pause', () => { if (!pendingReload) baseline(); });
-      listen('seeking', () => { healthySince = null; baseline(); });
-      listen('seeked', baseline);
+      listen('seeking', () => { healthySince = null; resetFrameTracking(); });
+      listen('seeked', () => {
+        // 向后跳转后旧帧的 mediaTime 不再适合作为比较基准。
+        resetFrameTracking();
+        if (!video.paused && !video.ended && !isRealHidden()) trackFrame();
+      });
       listen('emptied', () => {
         if (!pendingReload) { attempts = 0; playingVideos.delete(video); }
         frameAttempts = 0;
+        observedTime = video.currentTime;
+        observedProgressAt = observedFrameAt = null;
         resetFrameTracking();
       });
       for (const event of ['waiting', 'stalled', 'error']) listen(event, () => record(event));
@@ -559,11 +576,15 @@
         // 致命加载错误会使 paused=true；必须在暂停判断之前检查 HLS 回退。
         if (hlsFallback) hlsFallback.check();
         const now = performance.now();
+        if (video.currentTime > observedTime + 0.02 && !video.seeking) observedProgressAt = now;
+        observedTime = video.currentTime;
         const delayed = now - lastTick > 5000;
         lastTick = now;
         onVisibility(isRealHidden());
         if (source !== video.currentSrc && !pendingReload) {
           source = video.currentSrc;
+          observedTime = video.currentTime;
+          observedProgressAt = observedFrameAt = null;
           attempts = 0;
           lastAttempt = -Infinity;
           healthySince = null;
