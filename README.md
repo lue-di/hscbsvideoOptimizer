@@ -186,6 +186,14 @@ __tbVideoPlayer.recovery.retry();
 
 更新脚本后刷新播放页面，`__tbVideoPlayer.recovery.state().scriptVersion` 应为 `1.4.3`。本地模拟回归测试不能替代真实浏览器中的解码与切页验证。
 
+#### 方案 B 1.4.4：后台原生 HLS 缓冲耗尽恢复
+
+后台播放仍记录持续停滞时间。看门狗正常运行、播放未暂停／拖动、在线，且进度连续约 12 秒不动、原生 HLS 缓冲余量不足 0.5 秒时，允许尝试 hls.js 回退。沿用每个地址一次自动回退的限制；后台不执行普通微跳或 `load()` 重置，画面帧检测仍仅在前台启用。浏览器长时间挂起定时器时会重新计时，实际触发可能晚于 12 秒。
+
+等待回退库时若播放自行恢复、缓冲补足、用户操作、离线或换课，则取消接管。回退不能保证解决服务端或网络断流；原生 HLS 日志没有分片 HTTP 状态码，不能仅凭 `waiting`／`stalled` 判定服务器故障。
+
+更新后刷新播放页面，版本应为 `1.4.4`；后台回退触发时事件历史会出现 `hls-background-stall-fallback`。
+
 ### 3. 视频水印控制器 (`__hsWatermarkRemover`)
 
 两款脚本均内置水印控制器实例 `window.__hsWatermarkRemover`（同时兼容 `window.__tabbit_watermark_remover__`）：

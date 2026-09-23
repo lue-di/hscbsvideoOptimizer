@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         沪上插班生视频播放器替换
 // @namespace    https://wq.bunanguo.com/
-// @version      1.4.3
+// @version      1.4.4
 // @description  使用 Plyr 接管沪上插班生播放器，保留原视频地址，原生 HLS 解析失败时尝试 hls.js 回退，支持卡顿恢复、网页全屏、快捷键、去水印与后台播放
 // @author       zhujunxi
 // @license      GPL-3.0-or-later
@@ -158,7 +158,7 @@
       return hlsLibraryPromise;
     }
 
-    // 仅对原生 .m3u8 的不支持/解析错误回退；不接管已有 blob/MSE 或 MediaStream。
+    // 对原生 .m3u8 的解析错误或持续缓冲耗尽回退；不接管已有 blob/MSE 或 MediaStream。
     function createHlsFallback(video, loadLibrary = loadHlsLibrary) {
       let disposed = false;
       let loading = false;
@@ -220,7 +220,7 @@
           if (disposed || token !== generation || !attached() || video.srcObject ||
               video.src !== src || (video.currentSrc && video.currentSrc !== src) ||
               (reason === 'native-hls-parse-failed' ? video.error?.code !== 4 :
-                video.paused || video.seeking || isRealHidden() ||
+                video.paused || video.seeking || video.ended || !saved || navigator.onLine === false ||
                 Math.abs(video.currentTime - initialPosition) > 0.5 || !bufferExhausted())) return;
           if (!Hls.isSupported()) { fail('mse-unsupported'); return; }
           originalSrc = src;
@@ -294,7 +294,7 @@
       function recoverStall() {
         const src = video.src;
         if (disposed || hls || loading || !attached() || video.srcObject || video.paused ||
-            video.ended || video.seeking || isRealHidden() || navigator.onLine === false ||
+            video.ended || video.seeking || navigator.onLine === false ||
             !isHlsUrl(src) || (video.currentSrc && video.currentSrc !== src) ||
             attempted.has(src) || !bufferExhausted()) return false;
         void start(src, 'native-hls-buffer-stalled');
@@ -378,7 +378,7 @@
       const ranges = () => Array.from({ length: video.buffered.length }, (_, i) =>
         [video.buffered.start(i), video.buffered.end(i)]);
       const state = () => ({
-        scriptVersion: '1.4.3',
+        scriptVersion: '1.4.4',
         currentTime: video.currentTime, paused: video.paused, seeking: video.seeking,
         realHidden: isRealHidden(), online: navigator.onLine !== false,
         progressIdleMs: observedProgressAt === null ? null : Math.round(performance.now() - observedProgressAt),
@@ -494,8 +494,18 @@
       function recover(reason) {
         const now = performance.now();
         if (disposed || !video.isConnected || video !== pickVideo() || video.paused ||
-            video.ended || video.seeking || isRealHidden() || navigator.onLine === false ||
+            video.ended || video.seeking || navigator.onLine === false ||
             pendingReload || attempts >= 3 || now - lastAttempt < 15000) return false;
+        // 后台只允许确认缓冲耗尽的原生 HLS 回退，禁止普通 seek/load。
+        if (isRealHidden()) {
+          if (reason !== 'playback-stalled' || !hlsFallback?.recoverStall?.()) return false;
+          attempts++;
+          lastAttempt = now;
+          healthySince = null;
+          record('hls-background-stall-fallback');
+          baseline();
+          return true;
+        }
         attempts++;
         lastAttempt = now;
         healthySince = null;
@@ -592,12 +602,12 @@
           resetFrameTracking();
         }
         if (disposed || !video.isConnected || video !== pickVideo() || video.paused ||
-            video.ended || video.seeking || isRealHidden() || delayed || navigator.onLine === false) {
+            video.ended || video.seeking || delayed || navigator.onLine === false) {
           healthySince = null;
           baseline();
           return;
         }
-        trackFrame();
+        if (!isRealHidden()) trackFrame();
         const advanced = video.currentTime > lastTime + 0.02;
         if (advanced) {
           lastProgress = now;
@@ -606,7 +616,7 @@
         } else healthySince = null;
         lastTime = video.currentTime;
         if (now - lastProgress >= 12000) recover('playback-stalled');
-        else if (video.requestVideoFrameCallback && now - lastFrame >= (now < foregroundUntil ? 1500 : 4000) &&
+        else if (!isRealHidden() && video.requestVideoFrameCallback && now - lastFrame >= (now < foregroundUntil ? 1500 : 4000) &&
             video.currentTime - frameTime > 0.5 && video.readyState >= 2) recoverFrames();
       }, 1000);
       return {

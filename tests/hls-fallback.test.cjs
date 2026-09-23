@@ -48,7 +48,7 @@ function harness(options = {}) {
   }
   const context = vm.createContext({
     Date, navigator: { onLine: true }, document,
-    isRealHidden: () => false, pickVideo: () => video,
+    isRealHidden: () => !!options.hidden, pickVideo: () => video,
     MutationObserver: class {
       constructor(fn) { observer = this; this.callback = fn; }
       observe() {} disconnect() { this.disconnected = true; }
@@ -165,5 +165,40 @@ test('unavailable library and unsupported MSE fail once without changing the sou
     h.controller.check(); await flush(); h.controller.check(); await flush();
     assert.equal(h.loadCalls, 1); assert.equal(h.controller.state().status, 'failed');
     assert.equal(h.video.src, original);
+  }
+});
+
+
+test('background exhausted HLS falls back once and preserves playback intent', async () => {
+  const h = harness({ hidden: true }); h.video.paused = false; h.video.error = null;
+  assert.equal(h.controller.recoverStall(), true); await flush();
+  assert.equal(h.instances.length, 1);
+  h.video.emit('loadedmetadata'); h.video.emit('canplay');
+  assert.equal(h.video.plays, 1); assert.equal(h.video.currentTime, 42);
+  assert.equal(h.controller.recoverStall(), false);
+});
+
+test('background pause, offline, seeking and buffered playback prevent fallback', () => {
+  for (const mode of ['paused', 'offline', 'seeking', 'buffered']) {
+    const h = harness({ hidden: true }); h.video.paused = false; h.video.error = null;
+    if (mode === 'paused') h.video.paused = true;
+    if (mode === 'offline') h.context.navigator.onLine = false;
+    if (mode === 'seeking') h.video.seeking = true;
+    if (mode === 'buffered') h.video.buffered.end = () => 60;
+    assert.equal(h.controller.recoverStall(), false, mode);
+    assert.equal(h.loadCalls, 0);
+  }
+});
+
+test('user input or offline during stall library loading cancels takeover', async () => {
+  for (const mode of ['input', 'offline']) {
+    let complete;
+    const h = harness({ hidden: true, load: Hls => new Promise(resolve => { complete = () => resolve(Hls); }) });
+    h.video.paused = false; h.video.error = null;
+    h.controller.recoverStall();
+    if (mode === 'input') h.document.emit('keydown');
+    else h.context.navigator.onLine = false;
+    complete(); await flush();
+    assert.equal(h.instances.length, 0);
   }
 });

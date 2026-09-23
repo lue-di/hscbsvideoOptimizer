@@ -102,7 +102,7 @@ test('12 second native HLS stall tries fallback before load or seek', () => {
   h.tick(11); assert.equal(calls, 0);
   h.tick(1); assert.equal(calls, 1);
   assert.equal(h.video.loads, 0); assert.equal(h.seeks.length, 0);
-  assert.equal(h.recovery.state().scriptVersion, '1.4.3');
+  assert.equal(h.recovery.state().scriptVersion, '1.4.4');
 });
 
 test('MSE stall never calls load and stops retrying', () => {
@@ -249,7 +249,7 @@ test('hidden watchdog baselines do not fabricate frame or progress observations'
   assert.equal(state.progressIdleMs, 10000);
   assert.equal(state.frames.lastFrameAgoMs, 10000);
   assert.equal(state.frames.monitoring, false);
-  assert.equal(state.recoveryIdleMs, 0);
+  assert.equal(state.recoveryIdleMs, 10000);
 });
 
 test('no received frames are reported as unknown, including after a source change', () => {
@@ -281,4 +281,32 @@ test('stalled events alone do not trigger recovery while playback advances', () 
   assert.equal(event.realHidden, false);
   assert.equal(event.playbackRate, 1.5);
   assert.ok(event.bufferAhead > 0);
+});
+
+
+test('background HLS starvation waits 12 seconds and uses only bounded fallback', () => {
+  let calls = 0;
+  const h = harness({ src: 'https://example.test/a.m3u8', buffer: [[0, 10.36]],
+    fallback: { check() {}, state: () => ({}), recoverStall() { calls++; return true; } } });
+  h.hidden(true); h.tick(11); assert.equal(calls, 0);
+  h.tick(1); assert.equal(calls, 1);
+  h.tick(14); assert.equal(calls, 1);
+  h.tick(60); assert.equal(calls, 3);
+  assert.equal(h.video.loads, 0); assert.equal(h.seeks.length, 0);
+  assert.equal(h.recovery.state().history[0].action, 'hls-background-stall-fallback');
+});
+
+test('advancing background playback never requests HLS stall fallback', () => {
+  let calls = 0;
+  const h = harness({ fallback: { check() {}, recoverStall() { calls++; return true; } } });
+  h.hidden(true); h.tick(60, 1);
+  assert.equal(calls, 0); assert.equal(h.video.loads, 0); assert.equal(h.seeks.length, 0);
+});
+
+test('background fallback refusal never causes seek or load', () => {
+  const h = harness({ src: 'https://example.test/a.m3u8', buffer: [[0, 10.36]],
+    fallback: { check() {}, state: () => ({}), recoverStall() { return false; } } });
+  h.hidden(true); h.tick(60);
+  assert.equal(h.video.loads, 0); assert.equal(h.seeks.length, 0);
+  assert.equal(h.recovery.state().attempts, 0);
 });
