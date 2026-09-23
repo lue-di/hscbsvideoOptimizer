@@ -171,6 +171,12 @@ __tbVideoPlayer.recovery.retry();
 
 诊断中的 `frames` 提供帧监控状态，历史中的 `foreground-frame-check`、`frame-resync-seek`、`frames-resumed` 分别表示切回检测、同步尝试与新帧恢复。检测依据：[requestVideoFrameCallback 的帧提交与 mediaTime](https://developer.mozilla.org/en-US/docs/Web/API/HTMLVideoElement/requestVideoFrameCallback)。
 
+#### 方案 B 1.4.2：原生 HLS 缓冲耗尽回退
+
+前台播放进度停住约 12 秒，且原生 `.m3u8` 当前缓冲余量不足 0.5 秒时，即使没有错误码，也尝试一次 hls.js 回退。沿用原地址与有限重试机制，尝试恢复进度和原播放意图。等待库加载时若原生播放自行恢复、用户暂停或切课，则取消过期接管。切页不会因此主动暂停；发生回退时媒体管线切换可能带来短暂中断，不能保证修复服务器异常。
+
+诊断新增 `scriptVersion`、`realHidden`、`online`、`progressIdleMs` 和 `watchdogIdleMs`。更新油猴脚本后必须刷新已有播放页面，运行 `__tbVideoPlayer.recovery.state().scriptVersion` 应返回 `1.4.2`；缺少该字段说明页面还未运行此版本。
+
 ### 3. 视频水印控制器 (`__hsWatermarkRemover`)
 
 两款脚本均内置水印控制器实例 `window.__hsWatermarkRemover`（同时兼容 `window.__tabbit_watermark_remover__`）：

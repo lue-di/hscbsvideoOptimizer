@@ -95,6 +95,16 @@ test('12 second stall skips only a small buffered gap and respects cooldown', ()
   h.tick(14); assert.equal(h.recovery.state().attempts, 1);
 });
 
+test('12 second native HLS stall tries fallback before load or seek', () => {
+  let calls = 0;
+  const h = harness({ src: 'https://example.test/a.m3u8', buffer: [[0, 10.157]],
+    fallback: { check() {}, state: () => ({}), recoverStall() { calls++; return true; } } });
+  h.tick(11); assert.equal(calls, 0);
+  h.tick(1); assert.equal(calls, 1);
+  assert.equal(h.video.loads, 0); assert.equal(h.seeks.length, 0);
+  assert.equal(h.recovery.state().scriptVersion, '1.4.2');
+});
+
 test('MSE stall never calls load and stops retrying', () => {
   const h = harness({ buffer: [[30, 40]] }); h.tick(60);
   assert.equal(h.video.loads, 0); assert.equal(h.seeks.length, 0);

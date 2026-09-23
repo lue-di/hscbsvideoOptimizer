@@ -23,6 +23,7 @@ function harness(options = {}) {
     currentSrc: 'https://example.test/lesson.m3u8?secret=private',
     srcObject: null, isConnected: true, paused: true, error: { code: 4 },
     currentTime: 42, duration: 100, playbackRate: 1.5, volume: 0.6, muted: true,
+    buffered: { length: 1, start: () => 20, end: () => 42.157 },
     closest: () => null, plays: 0,
     play() { this.plays++; this.paused = false; return Promise.resolve(); }
   });
@@ -82,6 +83,31 @@ test('healthy HLS, blob, MP4 and media streams are not taken over', async () => 
     if (type === 'stream') h.video.srcObject = {};
     h.controller.check(); await flush(); assert.equal(h.loadCalls, 0, type);
   }
+});
+
+test('exhausted native HLS can fall back without error code and resume at the saved position', async () => {
+  const h = harness(); h.video.paused = false; h.video.error = null;
+  assert.equal(h.controller.recoverStall(), true); await flush();
+  assert.equal(h.instances.length, 1);
+  h.video.emit('loadedmetadata'); h.video.emit('canplay');
+  assert.equal(h.video.currentTime, 42); assert.equal(h.video.plays, 1);
+  assert.equal(h.controller.recoverStall(), false);
+});
+
+test('native HLS resumed during library loading is not interrupted', async () => {
+  let complete;
+  const h = harness({ load: Hls => new Promise(resolve => { complete = () => resolve(Hls); }) });
+  h.video.paused = false; h.video.error = null;
+  h.controller.recoverStall(); h.video.currentTime += 1; complete(); await flush();
+  assert.equal(h.instances.length, 0);
+});
+
+test('buffered video and intentional pause are not eligible for stall fallback', () => {
+  const h = harness(); h.video.error = null;
+  assert.equal(h.controller.recoverStall(), false);
+  h.video.paused = false; h.video.buffered.end = () => 60;
+  assert.equal(h.controller.recoverStall(), false);
+  assert.equal(h.loadCalls, 0);
 });
 
 test('switching lessons during library load cancels stale attachment', async () => {

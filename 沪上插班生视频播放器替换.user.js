@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         沪上插班生视频播放器替换
 // @namespace    https://wq.bunanguo.com/
-// @version      1.4.1
+// @version      1.4.2
 // @description  使用 Plyr 接管沪上插班生播放器，保留原视频地址，原生 HLS 解析失败时尝试 hls.js 回退，支持卡顿恢复、网页全屏、快捷键、去水印与后台播放
 // @author       zhujunxi
 // @license      GPL-3.0-or-later
@@ -203,7 +203,7 @@
         if (hls) { try { hls.stopLoad(); } catch (_) {} }
         record(action);
       }
-      async function start(src) {
+      async function start(src, reason = 'native-hls-parse-failed') {
         loading = true;
         const token = ++generation;
         attempted.add(src);
@@ -213,12 +213,15 @@
         saved = { position: video.currentTime, rate: video.playbackRate,
           volume: video.volume, muted: video.muted };
         resume = !video.paused;
-        record('native-hls-parse-failed');
+        const initialPosition = video.currentTime;
+        record(reason);
         try {
           const Hls = await loadLibrary();
           if (disposed || token !== generation || !attached() || video.srcObject ||
               video.src !== src || (video.currentSrc && video.currentSrc !== src) ||
-              video.error?.code !== 4) return;
+              (reason === 'native-hls-parse-failed' ? video.error?.code !== 4 :
+                video.paused || video.seeking || isRealHidden() ||
+                Math.abs(video.currentTime - initialPosition) > 0.5 || !bufferExhausted())) return;
           if (!Hls.isSupported()) { fail('mse-unsupported'); return; }
           originalSrc = src;
           mediaRecoveries = 0;
@@ -280,6 +283,23 @@
             video.error?.code !== 4 || attempted.has(src)) return;
         void start(src);
       }
+      function bufferExhausted() {
+        for (let i = 0; i < video.buffered.length; i++) {
+          if (video.buffered.start(i) <= video.currentTime &&
+              video.buffered.end(i) > video.currentTime + 0.5) return false;
+        }
+        return true;
+      }
+      // 由进度监控确认停滞后调用，不能只凭一次 stalled 事件切换管线。
+      function recoverStall() {
+        const src = video.src;
+        if (disposed || hls || loading || !attached() || video.srcObject || video.paused ||
+            video.ended || video.seeking || isRealHidden() || navigator.onLine === false ||
+            !isHlsUrl(src) || (video.currentSrc && video.currentSrc !== src) ||
+            attempted.has(src) || !bufferExhausted()) return false;
+        void start(src, 'native-hls-buffer-stalled');
+        return true;
+      }
       function onMetadata() {
         if (!hls || video.src !== ownedSrc || !saved) return;
         const position = saved.position;
@@ -312,6 +332,7 @@
       observer.observe(video, { attributes: true, attributeFilter: ['src'] });
       return {
         check,
+        recoverStall,
         state: () => ({ status, active: !!hls, library: 'hls.js 1.6.13', mediaRecoveries,
           lastError: lastError && { ...lastError }, history: history.map(item => ({ ...item })) }),
         destroy() {
@@ -353,7 +374,11 @@
       const ranges = () => Array.from({ length: video.buffered.length }, (_, i) =>
         [video.buffered.start(i), video.buffered.end(i)]);
       const state = () => ({
+        scriptVersion: '1.4.2',
         currentTime: video.currentTime, paused: video.paused, seeking: video.seeking,
+        realHidden: isRealHidden(), online: navigator.onLine !== false,
+        progressIdleMs: Math.round(performance.now() - lastProgress),
+        watchdogIdleMs: Math.round(performance.now() - lastTick),
         readyState: video.readyState, networkState: video.networkState,
         errorCode: video.error ? video.error.code : null,
         sourceType: video.srcObject ? 'stream' : !video.currentSrc ? 'empty' :
@@ -465,6 +490,11 @@
         healthySince = null;
         record(reason);
         const cur = video.currentTime;
+        if (reason === 'playback-stalled' && hlsFallback?.recoverStall?.()) {
+          record('hls-stall-fallback');
+          baseline();
+          return true;
+        }
         // 不跳到远处：只跨过 <= 0.5 秒的缓冲小间隙，或在已有缓冲内微跳。
         const buffer = ranges();
         const next = buffer.find(([start, end]) => start > cur && start - cur <= 0.5 && end - start > 0.1);
